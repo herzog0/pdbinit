@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+
+# Author: Teodoro Bertolozzi Mendes
+# Contact: teobmendes@gmail.com
+
+# This script's intent is help users to create a postgres environment for development
+
+# In development!
+
+POSTGRES_VERSION="12.0"
+POSTGRES_URL="https://ftp.postgresql.org/pub/source/v$POSTGRES_VERSION/postgresql-$POSTGRES_VERSION.tar.gz" 
+
+PGSQL_TARGET_DIR="/usr/local/pgsql"
+SOFTWARES_DIR="$HOME/Softwares/"
+INSTALLATION_FILES="$SOFTWARES_DIR/postgresql-$POSTGRES_VERSION"
+TAR_INSTALLATION_FILES="$INSTALLATION_FILES.tar.gz"
+
+VERBOSE='false'
+DB_NAME=''
+INIT_SCRIPT=''
+ROLES=''
+EXTENSIONS=''
+
+# Auxiliary system functions
+function error() {
+	>&2 echo "$@"
+	print_usage
+	exit 1
+}
+
+function pushd () {
+	command pushd "$@" > /dev/null
+}
+
+function popd () {
+	command popd "$@" > /dev/null
+}
+
+function execute () {
+	echo inside $(pwd)
+	COMMAND="$*"
+	if $VERBOSE
+	then
+		$COMMAND
+	else
+		echo "Running task: $COMMAND"
+		$COMMAND > /dev/null 2>&1
+	fi
+}
+
+
+# Auxiliary specific functions
+
+function require_root () {
+	if [ $(whoami) != "root" ]; then
+		error "You need to run this script as root!"
+	fi
+}
+
+function get_pgsql() {
+	type wget > /dev/null 2>&1 || {
+		error "You need wget to run this script"
+	}
+	wget -nv --show-progress "$POSTGRES_URL" || {
+		error "For some reason, postgresql-$POSTGRES_VERSION could not be downloaded. Check the resources and, if needed, change the address inside this script."
+	}
+}
+
+
+function untar () {
+	type tar > /dev/null 2>&1 || {
+		error "You need tar to run this script!"
+	}
+	execute tar -zxvf "$@" 
+}
+
+function check_or_install_lib() {
+	PKG_OK=$(dpkg-query -W --showformat='${Status}\n' $1|grep "install ok installed")
+	echo "Checking for lib $1: $PKG_OK"
+	if [ "" == "$PKG_OK" ]; then
+	  echo "$1 not installed. Installing..."
+	  sudo apt-get --force-yes --yes install $1
+	fi	
+}
+
+
+# Basic checks and ambient preparation
+function ambient_preparation () {
+	if [ ! -d "$PGSQL_TARGET_DIR" ]; then
+	    echo "$PGSQL_TARGET_DIR doesn't exist. Assuming not installed."
+	    echo "Checking for installation files in $SOFTWARES_DIR"
+	    if [ ! -d "$SOFTWARES_DIR" ]; then
+		    mkdir -p "$SOFTWARES_DIR"
+	    fi
+	
+	    pushd $SOFTWARES_DIR
+	    if [ ! -d "$INSTALLATION_FILES" ]; then
+		if [ ! -d "$TAR_INSTALLATION_FILES" ]; then
+			echo "Downloading pgsql files..."
+			get_pgsql
+		fi
+		echo "Extracting installation files to $INSTALLATION_FILES..."
+		untar "postgresql-$POSTGRES_VERSION.tar.gz"
+	    fi
+	    popd
+	    
+	    # check for basic requirements (make and gnu c compiler)
+	    check_or_install_lib "build-essential"
+
+ 	    # Check if dependencies are installed
+	    check_or_install_lib "libreadline-dev"
+	    check_or_install_lib "libghc-zlib-dev"
+	    pushd $INSTALLATION_FILES
+		execute "./configure --with-uuid=e2fs"
+		# make using 8 CPU cores, if available
+		execute "make -j 8"
+	
+		execute "make install"
+
+		pushd $INSTALLATION_FILES/contrib
+			execute "make -j 8"
+			pushd $INSTALLATION_FILES/contrib/uuid-ossp
+				execute "make"
+				execute "make install"
+			popd
+		popd
+		execute "adduser postgres"
+	    popd
+
+	fi
+}
+
+
+function set_db_instance() {
+	execute "mkdir -p $DB_DATA_FOLDER"
+	execute "chown postgres $DB_DATA_FOLDER"
+	su - postgres bash -c "$PGSQL_TARGET_DIR/bin/initdb -D $DB_DATA_FOLDER;$PGSQL_TARGET_DIR/bin/pg_ctl -D $DB_DATA_FOLDER -l logfile_${DB_NAME} start;$PGSQL_TARGET_DIR/bin/createdb $DB_NAME"
+	
+	#su - postgres bash -c "$PGSQL_TARGET_DIR/bin/pg_ctl -D $DB_DATA_FOLDER -l logfile_${DB_NAME} start"
+
+	#su - postgres bash -c "$PGSQL_TARGET_DIR/bin/createdb $DB_NAME"
+
+	if [[ "$EXTENSIONS" && -e "$EXTENSIONS" ]]
+	then
+		su - postgres bash -c "$PGSQL_TARGET_DIR/bin/psql -d $DB_NAME -a -f $EXTENSIONS"
+	fi
+	
+	if [[ "$ROLES" && -e "$ROLES" ]]
+	then
+		su - postgres bash -c "$PGSQL_TARGET_DIR/bin/psql -d $DB_NAME -a -f $ROLES"
+	fi
+	
+	if [[ "$INIT_SCRIPT" &&  -e "$INIT_SCRIPT" ]]
+	then
+		su - postgres bash -c "$PGSQL_TARGET_DIR/bin/psql -d $DB_NAME -a -f $INIT_SCRIPT"
+	else
+		echo "No sql script to initialize this database"
+		echo "Running without initialization..."
+		# su - postgres bash -c "$PGSQL_TARGET_DIR/bin/psql $DB_NAME"
+		echo "If wanted, in the future, you can initialize it with the following command:"
+		echo "su - postgres bash -c '$PGSQL_TARGET_DIR/bin/psql -d $DB_NAME     -a -f <path/to/script>'"
+	fi
+
+}
+
+function require_db_name () {
+	if [ ! $DB_NAME ]; then
+		error "You need to pass a db name as argument"
+	fi
+}
+
+function main () {
+	require_root
+	require_db_name
+	ambient_preparation
+	set_db_instance
+}
+
+function reset_and_rm_all () {
+	require_root
+	read -p "Remove all installation files and database folders?[y/n] " -n 1 -r
+	echo    # (optional) move to a new line
+	if [[ $REPLY =~ ^[Yy]$ ]]
+	then
+		rm -rf $PGSQL_TARGET_DIR
+		rm -rf $INSTALLATION_FILES
+		rm -rf $TAR_INSTALLATION_FILES
+	fi
+}
+
+function stop_db () {
+	require_root
+	su - postgres bash -c "$PGSQL_TARGET_DIR/bin/pg_ctl stop -D $DB_DATA_FOLDER"
+}
+
+function start_db () {
+	require_root
+	su - postgres bash -c "$PGSQL_TARGET_DIR/bin/pg_ctl start -D $DB_DATA_FOLDER"
+}
+
+
+function listdbs () {
+	require_root
+	su - postgres bash -c "$PGSQL_TARGET_DIR/bin/psql -l"
+}
+
+function drop_db () {
+	require_root
+	su - postgres bash -c "$PGSQL_TARGET_DIR/bin/dropdb --host=localhost $DB_NAME"
+}
+
+function print_usage() {
+	printf "
+Usage: pdbinit [options]
+Options:
+	
+	-v		Verbose mode.
+	-h		This help message.
+	-d NAME		Create a database with NAME as the db name.	
+	-e PATH		Run a sql script to install extensions (require -d)
+	-i PATH		Run a sql script in the specified db (require -d).
+	-c PATH		Run a text-based command to create roles for the specified db (require -d).
+	-l		List all the databases created so far.
+	-k NAME		Stop the specified db server.
+	-s NAME		Start the specified db server.
+	-x NAME		Drop the specified local database.
+	-r		BE CAREFUL - Remove all psql installation files, folders and databases.
+"
+}
+
+while getopts ':vd:e:i:c:lk:s:x:hr' flag; do
+	case "${flag}" in
+		v) VERBOSE='true'
+			if [[ $# -eq 1 ]] ; then
+				error "There's nothing to be verbose about!"
+			fi;;
+		d) DB_NAME="${OPTARG}";;
+		e) EXTENSIONS="$(readlink -f ${OPTARG})"
+			require_db_name;;
+		i) INIT_SCRIPT="$(readlink -f ${OPTARG})"
+			require_db_name;;
+		c) ROLES="$(readlink -f ${OPTARG})"
+			require_db_name;;
+		l) listdbs
+			exit 1;;
+		k) DB_NAME="${OPTARG}"
+			DB_DATA_FOLDER="$PGSQL_TARGET_DIR/${DB_NAME}_data"
+			stop_db
+			exit 1;;
+		s) DB_NAME="${OPTARG}"
+			DB_DATA_FOLDER="$PGSQL_TARGET_DIR/${DB_NAME}_data"
+			start_db
+			exit 1;;
+		x) DB_NAME="${OPTARG}"
+			drop_db
+			exit 1;;
+		r) reset_and_rm_all
+			exit 1;;
+		h) print_usage
+			exit 1;;
+		:) error "Missing argument for -$OPTARG" >&2;;
+		*) error "Unexpected argument";;
+	esac
+done
+
+if [[ $# -eq 0 ]] ; then
+	error 'You must provide at least one argument!'
+fi
+
+
+DB_DATA_FOLDER="$PGSQL_TARGET_DIR/${DB_NAME}_data"
+main
+
